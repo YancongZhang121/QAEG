@@ -150,16 +150,14 @@ async def run_in_batches(dataset, batch_size=5):
     total_size = len(dataset)
     total_correct = 0
     total_samples_run = 0
+    total_recall_sum = 0.0
     num_batches = (total_size + batch_size - 1) // batch_size
 
     start_batch_idx = 0
     for i in range(start_batch_idx, num_batches):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, total_size)
-        print(
-            f"\n--- Running QAEG inference for batch {i + 1}/{num_batches}"
-            f" (samples: {start_idx}-{end_idx}) ---"
-        )
+        print(f"\n--- Running QAEG inference for batch {i + 1}/{num_batches} (samples: {start_idx}-{end_idx}) ---")
         batch_ds = dataset.select(range(start_idx, end_idx))
 
         try:
@@ -185,11 +183,7 @@ async def run_in_batches(dataset, batch_size=5):
                     printable_preds.append(repaired_json_str)
 
             # Print context-bounded generation results for current batch
-            print(
-                f"\n{'=' * 20} "
-                f"Batch {i + 1} QAEG context-bounded output details "
-                f"{'=' * 20}"
-            )
+            print(f"\n{'=' * 20} Batch {i + 1} QAEG context-bounded output details {'=' * 20}")
             for idx in range(len(batch_ds)):
                 original_idx = start_idx + idx
                 sample = batch_ds[idx]
@@ -202,39 +196,57 @@ async def run_in_batches(dataset, batch_size=5):
 
             all_predictions.extend(printable_preds)
 
-            # Evaluate answer accuracy for current batch
-            print(f"    📊 Starting evaluation of QAEG answers for current batch...")
+            # Evaluate answer accuracy and evidence coverage for current batch
+            print(f"    📊 Starting evaluation of QAEG answers and context recall for current batch...")
             batch_results = rag.evaluate(batch_ds, repaired_preds_dict, cot_format=True)
-            print(
-                f"✅ Batch {i + 1} QAEG exact match rate: "
-                f"{batch_results['exact_match']:.2f}%"
-            )
+
+            # Compute context recall for QAEG generation-stage available evidence
+            batch_recall_list = []
+            for j, item in enumerate(batch_ds):
+                gt_answer = item.get('answer', '').strip().lower()
+                sample_chunks = chunks[j]
+                # Handle different chunk formats: read 'text' field if dict, else string directly
+                if isinstance(sample_chunks, list):
+                    context_text = ' '.join([
+                        chunk.get('text', '') if isinstance(chunk, dict) else str(chunk)
+                        for chunk in sample_chunks
+                    ]).lower()
+                else:
+                    context_text = str(sample_chunks).lower()
+
+                gt_words = gt_answer.split()
+                if len(gt_words) == 0:
+                    sample_recall = 0.0
+                else:
+                    hit_count = sum(1 for word in gt_words if word in context_text)
+                    sample_recall = hit_count / len(gt_words)
+                batch_recall_list.append(sample_recall)
+
+            batch_context_recall = sum(batch_recall_list) / len(batch_recall_list) * 100 if batch_recall_list else 0.0
+
+            print(f"✅ Batch {i + 1} QAEG exact match rate: {batch_results['exact_match']:.2f}% | Context Recall: {batch_context_recall:.2f}%")
 
             batch_metrics.append({
                 "batch": i + 1,
                 "index_range": f"{start_idx}-{end_idx}",
                 "total_in_batch": len(batch_ds),
                 "valid_in_batch": len(batch_ds),
-                "metrics": batch_results
+                "metrics": batch_results,
+                "context_recall": batch_context_recall
             })
 
             # Update cumulative evaluation results
             total_samples_run += len(batch_ds)
             total_correct += len(batch_ds) * (batch_results['exact_match'] / 100)
+            total_recall_sum += sum(batch_recall_list)
 
             if total_samples_run > 0:
                 current_overall_em = (total_correct / total_samples_run) * 100
-                print(
-                    f"📈 Cumulative QAEG exact match rate up to now: "
-                    f"{current_overall_em:.2f}%"
-                )
+                current_overall_recall = (total_recall_sum / total_samples_run) * 100
+                print(f"📈 Cumulative QAEG exact match rate up to now: {current_overall_em:.2f}% | Cumulative Context Recall: {current_overall_recall:.2f}%")
 
         except Exception as e:
-            print(
-                f"❌ Batch {i + 1} QAEG inference failed"
-                f" (network retries exhausted), skipping this batch: "
-                f"{type(e).__name__}: {str(e)}"
-            )
+            print(f"❌ Batch {i + 1} QAEG inference failed (network retries exhausted), skipping this batch: {type(e).__name__}: {str(e)}")
             import traceback
             traceback.print_exc()
 
@@ -247,22 +259,19 @@ async def run_in_batches(dataset, batch_size=5):
     print("📊 QAEG all batches completed, summarizing evaluation results")
     if total_samples_run > 0:
         final_exact_match = (total_correct / total_samples_run) * 100
+        final_context_recall = (total_recall_sum / total_samples_run) * 100
     else:
         final_exact_match = 0.0
+        final_context_recall = 0.0
     final_results = {
         "exact_match": final_exact_match,
+        "context_recall": final_context_recall,
         "total_evaluated_samples": total_samples_run,
         "total_original_samples": total_size
     }
-    print(
-        f"🎯 QAEG overall Exact Match rate: "
-        f"{final_results['exact_match']:.2f}%"
-    )
-    print(
-        f"📦 Evaluated samples: "
-        f"{final_results['total_evaluated_samples']}/"
-        f"{final_results['total_original_samples']}"
-    )
+    print(f"🎯 QAEG overall Exact Match rate: {final_results['exact_match']:.2f}%")
+    print(f"🎯 QAEG overall Context Recall: {final_results['context_recall']:.2f}%")
+    print(f"📦 Evaluated samples: {final_results['total_evaluated_samples']}/{final_results['total_original_samples']}")
     print("=" * 40)
 
     # 5. Save QAEG predictions, batch metrics, and experiment configuration
